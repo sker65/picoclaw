@@ -10,9 +10,11 @@ import (
 	"bufio"
 	"context"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -28,6 +30,7 @@ import (
 	"github.com/sipeed/picoclaw/pkg/config"
 	"github.com/sipeed/picoclaw/pkg/cron"
 	"github.com/sipeed/picoclaw/pkg/devices"
+	"github.com/sipeed/picoclaw/pkg/health"
 	"github.com/sipeed/picoclaw/pkg/heartbeat"
 	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/migrate"
@@ -560,7 +563,7 @@ func gatewayCmd() {
 		})
 
 	// Setup cron tool and service
-	cronService := setupCronTool(agentLoop, msgBus, cfg.WorkspacePath())
+	cronService := setupCronTool(agentLoop, msgBus, cfg.WorkspacePath(), cfg.Agents.Defaults.RestrictToWorkspace)
 
 	heartbeatService := heartbeat.NewHeartbeatService(
 		cfg.WorkspacePath(),
@@ -590,6 +593,59 @@ func gatewayCmd() {
 	if err != nil {
 		fmt.Printf("Error creating channel manager: %v\n", err)
 		os.Exit(1)
+	}
+
+	configPath := getConfigPath()
+
+	saveConfigRawAtomic := func(path string, raw []byte) error {
+		// Validate incoming JSON against Config schema first.
+		validated := config.DefaultConfig()
+		if err := json.Unmarshal(raw, validated); err != nil {
+			return fmt.Errorf("invalid config json: %w", err)
+		}
+
+		// Ensure config dir exists.
+		dir := filepath.Dir(path)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			if os.IsPermission(err) {
+				return fmt.Errorf("config is not writable: %w", err)
+			}
+			return err
+		}
+
+		// Atomic write: write to temp file then rename.
+		tmp := path + ".tmp"
+		f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+		if err != nil {
+			if os.IsPermission(err) {
+				return fmt.Errorf("config is not writable")
+			}
+			return err
+		}
+		_, werr := f.Write(raw)
+		err = f.Close()
+		if werr != nil {
+			_ = os.Remove(tmp)
+			if os.IsPermission(werr) {
+				return fmt.Errorf("config is not writable")
+			}
+			return werr
+		}
+		if err != nil {
+			_ = os.Remove(tmp)
+			if os.IsPermission(err) {
+				return fmt.Errorf("config is not writable")
+			}
+			return err
+		}
+		if err := os.Rename(tmp, path); err != nil {
+			_ = os.Remove(tmp)
+			if os.IsPermission(err) {
+				return fmt.Errorf("config is not writable")
+			}
+			return err
+		}
+		return nil
 	}
 
 	var transcriber *voice.GroqTranscriber
@@ -626,7 +682,11 @@ func gatewayCmd() {
 		fmt.Println("⚠ Warning: No channels enabled")
 	}
 
-	fmt.Printf("✓ Gateway started on %s:%d\n", cfg.Gateway.Host, cfg.Gateway.Port)
+	if addr, err := cfg.Gateway.ResolvedAddr(); err == nil {
+		fmt.Printf("✓ Gateway started on %s\n", addr)
+	} else {
+		fmt.Printf("✓ Gateway started on %s:%d\n", cfg.Gateway.Host, cfg.Gateway.Port)
+	}
 	fmt.Println("Press Ctrl+C to stop")
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -654,24 +714,59 @@ func gatewayCmd() {
 		fmt.Println("✓ Device event service started")
 	}
 
+	shutdown := func(grace time.Duration) {
+		fmt.Println("\nShutting down...")
+
+		// Stop accepting new inbound work as early as possible.
+		_ = channelManager.StopAll(context.Background())
+		agentLoop.Stop()
+
+		idleCtx, idleCancel := context.WithTimeout(context.Background(), grace)
+		_ = agentLoop.WaitForIdle(idleCtx)
+		idleCancel()
+
+		cancel()
+    healthServer.Stop(context.Background())
+		deviceService.Stop()
+		heartbeatService.Stop()
+		cronService.Stop()
+		fmt.Println("✓ Gateway stopped")
+	}
+
+	if webuiCh, ok := channelManager.GetChannel("webui"); ok {
+		if wc, ok := webuiCh.(*channels.WebUIChannel); ok {
+			wc.SetConfigUpdate(func(raw []byte) error {
+				return saveConfigRawAtomic(configPath, raw)
+			})
+			wc.SetConfigRead(func() ([]byte, error) {
+				return os.ReadFile(configPath)
+			})
+			wc.SetDrainExit(func(timeout time.Duration) error {
+				shutdown(timeout)
+				os.Exit(0)
+				return nil
+			})
+		}
+	}
+
 	if err := channelManager.StartAll(ctx); err != nil {
 		fmt.Printf("Error starting channels: %v\n", err)
 	}
+
+	healthServer := health.NewServer(cfg.Gateway.Host, cfg.Gateway.Port)
+	go func() {
+		if err := healthServer.Start(); err != nil && err != http.ErrServerClosed {
+			logger.ErrorCF("health", "Health server error", map[string]interface{}{"error": err.Error()})
+		}
+	}()
+	fmt.Printf("✓ Health endpoints available at http://%s:%d/health and /ready\n", cfg.Gateway.Host, cfg.Gateway.Port)
 
 	go agentLoop.Run(ctx)
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt)
 	<-sigChan
-
-	fmt.Println("\nShutting down...")
-	cancel()
-	deviceService.Stop()
-	heartbeatService.Stop()
-	cronService.Stop()
-	agentLoop.Stop()
-	channelManager.StopAll(ctx)
-	fmt.Println("✓ Gateway stopped")
+	shutdown(30 * time.Second)
 }
 
 func statusCmd() {
@@ -973,14 +1068,14 @@ func getConfigPath() string {
 	return filepath.Join(home, ".picoclaw", "config.json")
 }
 
-func setupCronTool(agentLoop *agent.AgentLoop, msgBus *bus.MessageBus, workspace string) *cron.CronService {
+func setupCronTool(agentLoop *agent.AgentLoop, msgBus *bus.MessageBus, workspace string, restrict bool) *cron.CronService {
 	cronStorePath := filepath.Join(workspace, "cron", "jobs.json")
 
 	// Create cron service
 	cronService := cron.NewCronService(cronStorePath, nil)
 
 	// Create and register CronTool
-	cronTool := tools.NewCronTool(cronService, agentLoop, msgBus, workspace)
+	cronTool := tools.NewCronTool(cronService, agentLoop, msgBus, workspace, restrict)
 	agentLoop.RegisterTool(cronTool)
 
 	// Set the onJob handler

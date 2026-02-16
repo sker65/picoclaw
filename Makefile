@@ -1,4 +1,4 @@
-.PHONY: all build install uninstall clean help test
+.PHONY: all build install uninstall clean help test ui-deps ui-build
 
 # Build variables
 BINARY_NAME=picoclaw
@@ -63,6 +63,18 @@ BINARY_PATH=$(BUILD_DIR)/$(BINARY_NAME)-$(PLATFORM)-$(ARCH)
 # Default target
 all: build
 
+## ui-deps: Install UI dependencies (ui/)
+ui-deps:
+	@echo "Installing UI dependencies..."
+	@cd ui && npm install
+	@echo "UI dependencies installed"
+
+## ui-build: Build UI assets to ui/dist (ui/)
+ui-build: ui-deps
+	@echo "Building UI..."
+	@cd ui && npm run build
+	@echo "UI build complete: ui/dist"
+
 ## generate: Run generate
 generate:
 	@echo "Run generate..."
@@ -119,7 +131,7 @@ clean:
 	@rm -rf $(BUILD_DIR)
 	@echo "Clean complete"
 
-## fmt: Format Go code
+## vet: Run go vet for static analysis
 vet:
 	@$(GO) vet ./...
 
@@ -131,10 +143,18 @@ test:
 fmt:
 	@$(GO) fmt ./...
 
-## deps: Update dependencies
+## deps: Download dependencies
 deps:
+	@$(GO) mod download
+	@$(GO) mod verify
+
+## update-deps: Update dependencies
+update-deps:
 	@$(GO) get -u ./...
 	@$(GO) mod tidy
+
+## check: Run vet, fmt, and verify dependencies
+check: deps fmt vet test
 
 ## run: Build and run picoclaw
 run: build
